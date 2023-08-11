@@ -1,0 +1,196 @@
+#!/bin/bash
+
+# This script is meant to be used with terragrunt.
+# This script will scan the *.tf files in the current directory for aliased
+# providers and generate the provider declarations for the supported alias
+# values. Provider alias names indicate something about the environment
+# that the provider needs to be configured for. If a provider has only
+# one environment, that provider should use a generic "main" alias.
+# If a one-off provider is needed that is not covered here, just declare it
+# in a file where needed, like a providers.tf, and this script will not
+# interfere as long as you don't use a supported alias name contained here.
+
+# TODO
+#   This script should also generate the terraform { required_providers {} } blocks.
+#   The issue is that if someone chooses to use a provider not supported by this script
+#   for automagic configuration, there is no way for them to inject the provider into
+#   required_providers - there can be only one of those blocks.
+
+# ASSUMPTIONS
+#   - providers have been declared in main.tf previously. You can easily tweak the check for this if
+#     your environment is different.
+#   - credentials needed by providers are provided in environment variables
+#   - The following environment variables are available (I run terraform/terragrunt through atlantis, so they are):
+#     - GITHUB_BASE_URL
+#     - BASE_REPO_OWNER
+#     - BASE_REPO_NAME
+
+# Short circuit if there is still a main.tf as this is where I had previously declared providers.
+if [[ -s ./main.tf ]]; then
+  exit
+fi
+
+# Declare associative arrays to map provider aliases to needed values.
+# Add more regions as needed or change the keys to your preference.
+# For instance, a provider used as `aws.oh` would cause an aws provider of region us-east-2 to be declared.
+declare -A AWS_ALIAS_MAP=(
+  [oh]="us-east-2"
+  [va]="us-east-1"
+  [or]="us-west-2"
+  [br]="sa-east-1"
+  [ie]="eu-west-1"
+)
+
+# Use this for providers that you use with the same configuration for all environments. In my case, this means
+# things like an observability platform (we don't have a "staging" or "dev" datadog) or DNS service (depending on its provider config parameters).
+declare -A GENERIC_ALIAS_MAP=(
+  [main]="true"
+)
+
+# As a further example, here is map for using vsphere
+declare -A VSPHERE_ALIAS_MAP=(
+  [dc1-production]="vcenter.dc1.mycompany.com"
+  [dc2-staging]="stag-vcenter.dc2.mycompany.com"
+  [dc1-production]="vcenter.dc1.mycompany.com"
+  [dc2-staging]="stag-vcenter.dc2.mycompany.com"
+  [dc3-production]="vcenter.dc3.mycompany.com"
+  [dc3-staging]="stag-vcenter.dc3.mycompany.com"
+)
+
+# Maybe you are using the kubernetes provider and need to specify the config_path
+declare -A KUBERNETES_ALIAS_MAP=(
+  [cluster1-staging]=".kube/cluster1-staging"
+  [cluster1-production]=".kube/cluster1-production"
+  [cluster2-staging]=".kube/cluster2-staging"
+  [cluster2-production]=".kube/cluster2-production"
+)
+
+# Tweak this if you do not use assume_role for your aws authentication.
+generate_aws_provider_config () {
+  cat << CONFIG
+provider "aws" {
+  region = "${AWS_ALIAS_MAP[$alias]}"
+  alias  = "${alias}"
+  assume_role { role_arn = var.assumed_role_arn }
+CONFIG
+  if grep -q common_tags locals.tf; then
+    cat << CONFIG
+  default_tags {
+    tags = local.common_tags
+  }
+CONFIG
+  fi
+  echo '}'
+}
+
+generate_vsphere_provider_config () {
+  cat << CONFIG
+provider "vsphere" {
+  alias                = "${alias}"
+  allow_unverified_ssl = true
+  vsphere_server       = "${VSPHERE_ALIAS_MAP[$alias]}"
+}
+CONFIG
+}
+
+generate_kubernetes_provider_config () {
+  cat << CONFIG
+provider "kubernetes" {
+  alias       = "${alias}"
+  config_path = "${KUBERNETES_ALIAS_MAP[$alias]}"
+}
+CONFIG
+}
+
+generate_helm_provider_config () {
+  cat << CONFIG
+provider "helm" {
+  alias       = "${alias}"
+  kubernetes {
+    config_path = "${KUBERNETES_ALIAS_MAP[$alias]}"
+  }
+}
+CONFIG
+}
+
+generate_datadog_provider_config () {
+  cat << CONFIG
+provider "datadog" {
+  alias = "${alias}"
+}
+CONFIG
+}
+
+cat << TFBLOCK
+terraform {
+  backend "s3" {
+  }
+}
+TFBLOCK
+
+# Find all of the providers that we support.
+# This script will ignore unknown aliases so as not to conflict with any custom provider configuration.
+
+# This is a tricky part and I have probably done it in a clumsy way. Here are the assumptions made to match
+# my environment:
+#   - You are using a github instance at git.mycompany.com with your terraform repository(s) in an
+#     organization named terraforms
+#   - The following environment variables are available (I run terraform/terragrunt through atlantis, so they are):
+#     - GITHUB_BASE_URL
+#     - BASE_REPO_OWNER
+#     - BASE_REPO_NAME
+#     - if you don't have these it will take a bit more work to handle the case where you don't have both upstream
+#       and origin remotes in place.
+# In order to catch a circumstance where the last resource(s) that use a provider have been deleted,
+# we need to also load in the provider definitions from the diff between here and the default upstream branch (main).
+
+# Which remote is the upstream one. It'll be an https or git+ssh url of git.main.com/terraforms/
+upstream_remote=$(git remote -v | grep -E 'git.mycompany.com[:/]{1}terraforms/' |awk '{print $1}' |sort -u |head -1)
+if [[ "${upstream_remote}x" == "x" ]]; then
+  # we didn't find the upstream remote. We need to add it.
+  if [[ -n "${GITHUB_BASE_URL}" && -n "${BASE_REPO_OWNER}" && -n "${BASE_REPO_NAME}" ]]; then
+    # we're in atlantis, so we can use this info to add the upstream remote.
+    git remote add pr_upstream "${GITHUB_BASE_URL}${BASE_REPO_OWNER}/${BASE_REPO_NAME}"
+    git fetch pr_upstream --quiet
+    upstream_remote="pr_upstream"
+  else
+    # well, you must be running this locally and not have an upstream remote. What you doing?
+    exit
+  fi
+fi
+# Grab all of the line removed from files that have the word provider in them and put them into a file.
+# We'll remove it after we check it and everything else for providers.
+git diff ${upstream_remote}/main --no-color --ignore-all-space -G provider . | grep '^-' > tmpbuildingproviders.tf
+
+# Always check for a standard `provider = blah.alias` and a provider passed into a module like `blah.something = blah.something`
+for alias in $(grep -E '\s+aws\.\w+\s+=\s+aws\.|provider\s+=\s+aws\.' -- *.tf | awk '{print $4}' | sort -u | cut -d. -f2); do
+  if [[ -n ${AWS_ALIAS_MAP[$alias]} ]]; then
+    generate_aws_provider_config
+  fi
+done
+
+for alias in $(grep -E '\s+vsphere\.\w+\s+=\s+vsphere\.|provider\s+=\s+vsphere\.' -- *.tf | awk '{print $4}' | sort -u | cut -d. -f2); do
+  if [[ -n ${VSPHERE_ALIAS_MAP[$alias]} ]]; then
+    generate_vsphere_provider_config
+  fi
+done
+
+for alias in $(grep -E '\s+kubernetes\.\w+\s+=\s+kubernetes\.|provider\s+=\s+kubernetes\.' -- *.tf | awk '{print $4}' | sort -u | cut -d. -f2); do
+  if [[ -n ${KUBERNETES_ALIAS_MAP[$alias]} ]]; then
+    generate_kubernetes_provider_config
+  fi
+done
+
+for alias in $(grep -E '\s+helm\.\w+\s+=\s+helm\.|provider\s+=\s+helm\.' -- *.tf | awk '{print $4}' | sort -u | cut -d. -f2); do
+  if [[ -n ${KUBERNETES_ALIAS_MAP[$alias]} ]]; then
+    generate_helm_provider_config
+  fi
+done
+
+for alias in $(grep -E '\s+datadog\.\w+\s+=\s+datadog\.|provider\s+=\s+datadog\.' -- *.tf | awk '{print $4}' | sort -u | cut -d. -f2); do
+  if [[ -n ${GENERIC_ALIAS_MAP[$alias]} ]]; then
+    generate_datadog_provider_config
+  fi
+done
+
+rm tmpbuildingproviders.tf

@@ -1,0 +1,26 @@
+= Automatically build provider configurations at runtime using terragrunt
+
+== The problem
+
+As our terraform configurations get more complex and require more providers, it can become a stumbling block to get people to properly declare all of the providers needed for their configuration.
+I noticed an increasing waste of cycles on just this issue, especially with newer users trying to use terraform in our organization.
+
+== A solution
+
+To help alleviate this frustration, I decided that it would be easier to enforce a standard set of provider aliases than to get users to use the correct provider configuration for a given environment/situation.
+I started to think how terragrunt ccould help with this and the https://terragrunt.gruntwork.io/docs/reference/config-blocks-and-attributes/#generate[generate] block seemed the best candidate.
+I found that I had to combine this with https://terragrunt.gruntwork.io/docs/reference/built-in-functions/#run_cmd[run_cmd()] to download the script at runtime so I didn't have to keep an updated script in every terraform repository that I have.
+
+== Assumptions
+
+* Providers have been declared in main.tf previously. You can easily tweak the check for this if your environment is different.
+* Credentials needed by providers are provided in environment variables.
+* The following environment variables are available (I run terraform/terragrunt through atlantis, so they are):
+** GITHUB_BASE_URL
+** BASE_REPO_OWNER
+** BASE_REPO_NAME
+
+== Caveats
+
+You still have to declare a https://developer.hashicorp.com/terraform/language/providers/requirements[required_providers] block.
+The issue is that if someone chooses to use a provider not supported by this script for automagic configuration, there is no way for them to inject the provider into `required_providers` - there can be only one of those blocks.
